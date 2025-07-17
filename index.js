@@ -1,140 +1,88 @@
+import { UnknownAction } from "../errors.js";
+import { SessionStore } from "./utils/cookie.js";
+import { init } from "./init.js";
+import renderPage from "./pages/index.js";
+import * as actions from "./actions/index.js";
+import { validateCSRF } from "./actions/callback/oauth/csrf-token.js";
+/** @internal */
+export async function AuthInternal(request, authOptions) {
+    const { action, providerId, error, method } = request;
+    const csrfDisabled = authOptions.skipCSRFCheck === skipCSRFCheck;
+    const { options, cookies } = await init({
+        authOptions,
+        action,
+        providerId,
+        url: request.url,
+        callbackUrl: request.body?.callbackUrl ?? request.query?.callbackUrl,
+        csrfToken: request.body?.csrfToken,
+        cookies: request.cookies,
+        isPost: method === "POST",
+        csrfDisabled,
+    });
+    const sessionStore = new SessionStore(options.cookies.sessionToken, request.cookies, options.logger);
+    if (method === "GET") {
+        const render = renderPage({ ...options, query: request.query, cookies });
+        switch (action) {
+            case "callback":
+                return await actions.callback(request, options, sessionStore, cookies);
+            case "csrf":
+                return render.csrf(csrfDisabled, options, cookies);
+            case "error":
+                return render.error(error);
+            case "providers":
+                return render.providers(options.providers);
+            case "session":
+                return await actions.session(options, sessionStore, cookies);
+            case "signin":
+                return render.signin(providerId, error);
+            case "signout":
+                return render.signout();
+            case "verify-request":
+                return render.verifyRequest();
+            case "webauthn-options":
+                return await actions.webAuthnOptions(request, options, sessionStore, cookies);
+            default:
+        }
+    }
+    else {
+        const { csrfTokenVerified } = options;
+        switch (action) {
+            case "callback":
+                if (options.provider.type === "credentials")
+                    // Verified CSRF Token required for credentials providers only
+                    validateCSRF(action, csrfTokenVerified);
+                return await actions.callback(request, options, sessionStore, cookies);
+            case "session":
+                validateCSRF(action, csrfTokenVerified);
+                return await actions.session(options, sessionStore, cookies, true, request.body?.data);
+            case "signin":
+                validateCSRF(action, csrfTokenVerified);
+                return await actions.signIn(request, cookies, options);
+            case "signout":
+                validateCSRF(action, csrfTokenVerified);
+                return await actions.signOut(cookies, sessionStore, options);
+            default:
+        }
+    }
+    throw new UnknownAction(`Cannot handle action: ${action}`);
+}
 /**
- *
- * :::warning Experimental
- * `@auth/core` is under active development.
+ * :::danger
+ * This option is intended for framework authors.
  * :::
  *
- * This is the main entry point to the Auth.js library.
- *
- * Based on the {@link https://developer.mozilla.org/en-US/docs/Web/API/Request Request}
- * and {@link https://developer.mozilla.org/en-US/docs/Web/API/Response Response} Web standard APIs.
- * Primarily used to implement [framework](https://authjs.dev/getting-started/integrations)-specific packages,
- * but it can also be used directly.
- *
- * ## Installation
- *
- * ```bash npm2yarn
- * npm install @auth/core
- * ```
- *
- * ## Usage
- *
- * ```ts
- * import { Auth } from "@auth/core"
- *
- * const request = new Request("https://example.com")
- * const response = await Auth(request, {...})
- *
- * console.log(response instanceof Response) // true
- * ```
- *
- * ## Resources
- *
- * - [Getting started](https://authjs.dev/getting-started)
- * - [Guides](https://authjs.dev/guides)
- *
- * @module @auth/core
+ * Auth.js comes with built-in CSRF protection, but
+ * if you are implementing a framework that is already protected against CSRF attacks, you can skip this check by
+ * passing this value to {@link AuthConfig.skipCSRFCheck}.
  */
-import { assertConfig } from "./lib/utils/assert.js";
-import { AuthError, CredentialsSignin, ErrorPageLoop, isClientError, } from "./errors.js";
-import { AuthInternal, raw, skipCSRFCheck } from "./lib/index.js";
-import { setEnvDefaults, createActionURL } from "./lib/utils/env.js";
-import renderPage from "./lib/pages/index.js";
-import { logger, setLogger } from "./lib/utils/logger.js";
-import { toInternalRequest, toResponse } from "./lib/utils/web.js";
-import { isAuthAction } from "./lib/utils/actions.js";
-export { skipCSRFCheck, raw, setEnvDefaults, createActionURL, isAuthAction };
+export const skipCSRFCheck = Symbol("skip-csrf-check");
 /**
- * Core functionality provided by Auth.js.
+ * :::danger
+ * This option is intended for framework authors.
+ * :::
  *
- * Receives a standard {@link Request} and returns a {@link Response}.
- *
- * @example
- * ```ts
- * import { Auth } from "@auth/core"
- *
- * const request = new Request("https://example.com")
- * const response = await Auth(request, {
- *   providers: [Google],
- *   secret: "...",
- *   trustHost: true,
- * })
- *```
- * @see [Documentation](https://authjs.dev)
+ * Auth.js returns a web standard {@link Response} by default, but
+ * if you are implementing a framework you might want to get access to the raw internal response
+ * by passing this value to {@link AuthConfig.raw}.
  */
-export async function Auth(request, config) {
-    setLogger(config.logger, config.debug);
-    const internalRequest = await toInternalRequest(request, config);
-    // There was an error parsing the request
-    if (!internalRequest)
-        return Response.json(`Bad request.`, { status: 400 });
-    const warningsOrError = assertConfig(internalRequest, config);
-    if (Array.isArray(warningsOrError)) {
-        warningsOrError.forEach(logger.warn);
-    }
-    else if (warningsOrError) {
-        // If there's an error in the user config, bail out early
-        logger.error(warningsOrError);
-        const htmlPages = new Set([
-            "signin",
-            "signout",
-            "error",
-            "verify-request",
-        ]);
-        if (!htmlPages.has(internalRequest.action) ||
-            internalRequest.method !== "GET") {
-            const message = "There was a problem with the server configuration. Check the server logs for more information.";
-            return Response.json({ message }, { status: 500 });
-        }
-        const { pages, theme } = config;
-        // If this is true, the config required auth on the error page
-        // which could cause a redirect loop
-        const authOnErrorPage = pages?.error &&
-            internalRequest.url.searchParams
-                .get("callbackUrl")
-                ?.startsWith(pages.error);
-        // Either there was no error page configured or the configured one contains infinite redirects
-        if (!pages?.error || authOnErrorPage) {
-            if (authOnErrorPage) {
-                logger.error(new ErrorPageLoop(`The error page ${pages?.error} should not require authentication`));
-            }
-            const page = renderPage({ theme }).error("Configuration");
-            return toResponse(page);
-        }
-        return Response.redirect(`${pages.error}?error=Configuration`);
-    }
-    const isRedirect = request.headers?.has("X-Auth-Return-Redirect");
-    const isRaw = config.raw === raw;
-    try {
-        const internalResponse = await AuthInternal(internalRequest, config);
-        if (isRaw)
-            return internalResponse;
-        const response = toResponse(internalResponse);
-        const url = response.headers.get("Location");
-        if (!isRedirect || !url)
-            return response;
-        return Response.json({ url }, { headers: response.headers });
-    }
-    catch (e) {
-        const error = e;
-        logger.error(error);
-        const isAuthError = error instanceof AuthError;
-        if (isAuthError && isRaw && !isRedirect)
-            throw error;
-        // If the CSRF check failed for POST/session, return a 400 status code.
-        // We should not redirect to a page as this is an API route
-        if (request.method === "POST" && internalRequest.action === "session")
-            return Response.json(null, { status: 400 });
-        const isClientSafeErrorType = isClientError(error);
-        const type = isClientSafeErrorType ? error.type : "Configuration";
-        const params = new URLSearchParams({ error: type });
-        if (error instanceof CredentialsSignin)
-            params.set("code", error.code);
-        const pageKind = (isAuthError && error.kind) || "error";
-        const pagePath = config.pages?.[pageKind] ?? `${config.basePath}/${pageKind.toLowerCase()}`;
-        const url = `${internalRequest.url.origin}${pagePath}?${params}`;
-        if (isRedirect)
-            return Response.json({ url });
-        return Response.redirect(url);
-    }
-}
+export const raw = Symbol("return-type-raw");
